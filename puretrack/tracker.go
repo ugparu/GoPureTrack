@@ -9,36 +9,50 @@ import (
 )
 
 type Config struct {
-	trackNewThresh  float64
-	trackHighThresh float64
-	trackLowThresh  float64
-	matchThresh     float64
-	maxTimeLost     uint
+	TrackNewThresh        float64
+	DetHighThresh         float64
+	DetLowThresh          float64
+	MatchDetHighThresh    float64
+	MatchDetLowThresh     float64
+	UnconfMatchThresh     float64
+	RemoveDuplicateThresh float64
+	MaxFramesLost         uint
 }
 
 const initPoolSize = 2 << 5
 
 var BaseConfig = Config{
-	trackNewThresh:  0.6,
-	trackHighThresh: 0.6,
-	trackLowThresh:  0.1,
-	matchThresh:     0.9,
-	maxTimeLost:     30,
+	TrackNewThresh:        0.6,
+	DetHighThresh:         0.6,
+	DetLowThresh:          0.1,
+	MatchDetHighThresh:    0.9,
+	MatchDetLowThresh:     0.5,
+	UnconfMatchThresh:     0.7,
+	RemoveDuplicateThresh: 0.15,
+	MaxFramesLost:         30,
 }
 
 type Tracker[T Detection] struct {
 	Config
-	tracksPool map[uint]*track[T]
-	trackID    uint
-	frameID    uint
+	tracksPool  map[uint]*track[T]
+	trackID     uint
+	frameID     uint
+	means       [][8]float64
+	covs        [][64]float64
+	tracksBoxes [][4]float64
+	detsBoxes   [][4]float64
 }
 
 func New[T Detection](config Config) *Tracker[T] {
 	return &Tracker[T]{
-		Config:     config,
-		tracksPool: make(map[uint]*track[T], initPoolSize),
-		trackID:    1,
-		frameID:    1,
+		Config:      config,
+		tracksPool:  make(map[uint]*track[T], initPoolSize),
+		trackID:     1,
+		frameID:     1,
+		means:       nil,
+		covs:        nil,
+		tracksBoxes: nil,
+		detsBoxes:   nil,
 	}
 }
 
@@ -56,38 +70,40 @@ func (t *Tracker[T]) Update(detsXYXY []T) ([]Track[T], []Track[T]) {
 		return track.activated || track.TrackState == Lost
 	})
 
-	means := make([][8]float64, len(confirmedTracksIndexes))
-	covs := make([][64]float64, len(confirmedTracksIndexes))
-	tracksBoxes := make([][4]float64, len(confirmedTracksIndexes))
+	t.means = utils.AdjustSliceSize(t.means, len(confirmedTracksIndexes))
+	t.covs = utils.AdjustSliceSize(t.covs, len(confirmedTracksIndexes))
+	t.tracksBoxes = utils.AdjustSliceSize(t.tracksBoxes, len(confirmedTracksIndexes))
+
 	for i, id := range confirmedTracksIndexes {
-		means[i] = t.tracksPool[id].mean
+		t.means[i] = t.tracksPool[id].mean
 		if t.tracksPool[id].TrackState != Tracked {
-			means[i][7] = 0
+			t.means[i][7] = 0
 		}
-		covs[i] = t.tracksPool[id].cov
+		t.covs[i] = t.tracksPool[id].cov
 	}
 
 	// Predicting for all tracks
-	kalman.GetFilter().MultiPredict(means, covs)
+	kalman.GetFilter().MultiPredict(t.means, t.covs)
 
 	for i, id := range confirmedTracksIndexes {
-		t.tracksPool[id].mean = means[i]
-		t.tracksPool[id].cov = covs[i]
+		t.tracksPool[id].mean = t.means[i]
+		t.tracksPool[id].cov = t.covs[i]
 
-		tracksBoxes[i] = t.tracksPool[id].GetXYXY()
+		t.tracksBoxes[i] = t.tracksPool[id].GetXYXY()
 	}
 
 	// Calculating distances for high confidence detections and confirmed tracks
-	detsBoxes := make([][4]float64, len(detsHigh))
+	t.detsBoxes = utils.AdjustSliceSize(t.detsBoxes, len(detsHigh))
+
 	detsConfs := make([]float64, len(detsHigh))
 	for i, det := range detsHigh {
-		detsBoxes[i] = det.GetXYXY()
+		t.detsBoxes[i] = det.GetXYXY()
 		detsConfs[i] = det.GetScore()
 	}
 
 	var dists [][]float64
 	if len(detsHigh) != 0 {
-		dists = utils.IoUDistBatch(tracksBoxes, detsBoxes)
+		dists = utils.IoUDistBatch(t.tracksBoxes, t.detsBoxes)
 		dists = utils.FuseScore(dists, detsConfs)
 
 		castedDetections := make([]Detection, len(detsHigh))
@@ -119,18 +135,19 @@ func (t *Tracker[T]) Update(detsXYXY []T) ([]Track[T], []Track[T]) {
 	}
 
 	// Solving lap for high confidence detections and confirmed tracks
-	assignments, unmatchedTracks, unmatchedDets := lap.SolveLinearAssignmentProblem(len(confirmedTracksIndexes), len(detsHigh), dists, t.matchThresh)
+	assignments, unmatchedTracks, unmatchedDets := lap.SolveLinearAssignmentProblem(len(confirmedTracksIndexes), len(detsHigh), dists, t.MatchDetHighThresh)
 
 	// Updating matched confirmed tracks and high detections
-	means = means[:len(assignments)]
-	covs = covs[:len(assignments)]
+	t.means = utils.AdjustSliceSize(t.means, len(assignments))
+	t.covs = utils.AdjustSliceSize(t.covs, len(assignments))
+
 	measurments := make([][4]float64, len(assignments))
 	for i, match := range assignments {
 		trackID := confirmedTracksIndexes[match[0]]
 		det := detsHigh[match[1]]
 
-		means[i] = t.tracksPool[trackID].mean
-		covs[i] = t.tracksPool[trackID].cov
+		t.means[i] = t.tracksPool[trackID].mean
+		t.covs[i] = t.tracksPool[trackID].cov
 
 		measurments[i] = det.GetXYXY()
 		measurments[i][2] -= measurments[i][0]
@@ -139,14 +156,14 @@ func (t *Tracker[T]) Update(detsXYXY []T) ([]Track[T], []Track[T]) {
 		measurments[i][1] += measurments[i][3] / 2
 	}
 
-	kalman.GetFilter().MultiUpdate(means, covs, measurments)
+	kalman.GetFilter().MultiUpdate(t.means, t.covs, measurments)
 
 	for i, match := range assignments {
 		trackID := confirmedTracksIndexes[match[0]]
 		det := detsHigh[match[1]]
 
-		t.tracksPool[trackID].mean = means[i]
-		t.tracksPool[trackID].cov = covs[i]
+		t.tracksPool[trackID].mean = t.means[i]
+		t.tracksPool[trackID].cov = t.covs[i]
 		t.tracksPool[trackID].detection = det
 		t.tracksPool[trackID].TrackState = Tracked
 		t.tracksPool[trackID].activated = true
@@ -165,30 +182,30 @@ func (t *Tracker[T]) Update(detsXYXY []T) ([]Track[T], []Track[T]) {
 		unmatchedDetsHigh[i] = detsHigh[index]
 	}
 
-	tracksBoxes = slices.Grow(tracksBoxes, len(unmatchedConfirmedTracksIndexes))[:len(unmatchedConfirmedTracksIndexes)]
+	t.tracksBoxes = utils.AdjustSliceSize(t.tracksBoxes, len(unmatchedConfirmedTracksIndexes))
 	for i, id := range unmatchedConfirmedTracksIndexes {
-		tracksBoxes[i] = t.tracksPool[id].GetXYXY()
+		t.tracksBoxes[i] = t.tracksPool[id].GetXYXY()
 	}
 
-	detsBoxes = slices.Grow(detsBoxes, len(detsLow))[:len(detsLow)]
+	t.detsBoxes = utils.AdjustSliceSize(t.detsBoxes, len(detsLow))
 	for i, det := range detsLow {
-		detsBoxes[i] = det.GetXYXY()
+		t.detsBoxes[i] = det.GetXYXY()
 	}
 
-	dists = utils.IoUDistBatch(tracksBoxes, detsBoxes)
+	dists = utils.IoUDistBatch(t.tracksBoxes, t.detsBoxes)
 
-	assignments, unmatchedTracks, _ = lap.SolveLinearAssignmentProblem(len(unmatchedConfirmedTracksIndexes), len(detsLow), dists, 0.5)
-	// fmt.Printf("%v\n", unmatchedConfirmedTracksIndexes)
+	assignments, unmatchedTracks, _ = lap.SolveLinearAssignmentProblem(len(unmatchedConfirmedTracksIndexes), len(detsLow), dists, t.MatchDetLowThresh)
 
-	means = slices.Grow(means, len(assignments))[:len(assignments)]
-	covs = slices.Grow(covs, len(assignments))[:len(assignments)]
+	t.means = utils.AdjustSliceSize(t.means, len(assignments))
+	t.covs = utils.AdjustSliceSize(t.covs, len(assignments))
+
 	measurments = slices.Grow(measurments, len(assignments))[:len(assignments)]
 	for i, match := range assignments {
 		trackID := unmatchedConfirmedTracksIndexes[match[0]]
 		det := detsLow[match[1]]
 
-		means[i] = t.tracksPool[trackID].mean
-		covs[i] = t.tracksPool[trackID].cov
+		t.means[i] = t.tracksPool[trackID].mean
+		t.covs[i] = t.tracksPool[trackID].cov
 		measurments[i] = det.GetXYXY()
 		measurments[i][2] -= measurments[i][0]
 		measurments[i][3] -= measurments[i][1]
@@ -196,14 +213,14 @@ func (t *Tracker[T]) Update(detsXYXY []T) ([]Track[T], []Track[T]) {
 		measurments[i][1] += measurments[i][3] / 2
 	}
 
-	kalman.GetFilter().MultiUpdate(means, covs, measurments)
+	kalman.GetFilter().MultiUpdate(t.means, t.covs, measurments)
 
 	for i, match := range assignments {
 		trackID := unmatchedConfirmedTracksIndexes[match[0]]
 		det := detsLow[match[1]]
 
-		t.tracksPool[trackID].mean = means[i]
-		t.tracksPool[trackID].cov = covs[i]
+		t.tracksPool[trackID].mean = t.means[i]
+		t.tracksPool[trackID].cov = t.covs[i]
 		t.tracksPool[trackID].detection = det
 		t.tracksPool[trackID].TrackState = Tracked
 		t.tracksPool[trackID].activated = true
@@ -214,29 +231,30 @@ func (t *Tracker[T]) Update(detsXYXY []T) ([]Track[T], []Track[T]) {
 		t.tracksPool[unmatchedConfirmedTracksIndexes[index]].TrackState = Lost
 	}
 
-	tracksBoxes = make([][4]float64, len(unconfirmedTracksIndexes))
+	t.tracksBoxes = utils.AdjustSliceSize(t.tracksBoxes, len(unconfirmedTracksIndexes))
 	for i, id := range unconfirmedTracksIndexes {
-		tracksBoxes[i] = t.tracksPool[id].GetXYXY()
+		t.tracksBoxes[i] = t.tracksPool[id].GetXYXY()
 	}
 
-	detsBoxes = make([][4]float64, len(unmatchedDetsHigh))
+	t.detsBoxes = utils.AdjustSliceSize(t.detsBoxes, len(unmatchedDetsHigh))
 	for i, det := range unmatchedDetsHigh {
-		detsBoxes[i] = det.GetXYXY()
+		t.detsBoxes[i] = det.GetXYXY()
 	}
 
-	dists = utils.IoUDistBatch(tracksBoxes, detsBoxes)
+	dists = utils.IoUDistBatch(t.tracksBoxes, t.detsBoxes)
 
-	assignments, unmatchedTracks, unmatchedDets = lap.SolveLinearAssignmentProblem(len(unconfirmedTracksIndexes), len(unmatchedDetsHigh), dists, 0.7)
+	assignments, unmatchedTracks, unmatchedDets = lap.SolveLinearAssignmentProblem(len(unconfirmedTracksIndexes), len(unmatchedDetsHigh), dists, t.UnconfMatchThresh)
 
-	means = slices.Grow(means, len(assignments))[:len(assignments)]
-	covs = slices.Grow(covs, len(assignments))[:len(assignments)]
+	t.means = utils.AdjustSliceSize(t.means, len(assignments))
+	t.covs = utils.AdjustSliceSize(t.covs, len(assignments))
+
 	measurments = slices.Grow(measurments, len(assignments))[:len(assignments)]
 	for i, match := range assignments {
 		trackID := unconfirmedTracksIndexes[match[0]]
 		det := unmatchedDetsHigh[match[1]]
 
-		means[i] = t.tracksPool[trackID].mean
-		covs[i] = t.tracksPool[trackID].cov
+		t.means[i] = t.tracksPool[trackID].mean
+		t.covs[i] = t.tracksPool[trackID].cov
 		measurments[i] = det.GetXYXY()
 		measurments[i][2] -= measurments[i][0]
 		measurments[i][3] -= measurments[i][1]
@@ -244,14 +262,14 @@ func (t *Tracker[T]) Update(detsXYXY []T) ([]Track[T], []Track[T]) {
 		measurments[i][1] += measurments[i][3] / 2
 	}
 
-	kalman.GetFilter().MultiUpdate(means, covs, measurments)
+	kalman.GetFilter().MultiUpdate(t.means, t.covs, measurments)
 
 	for i, match := range assignments {
 		trackID := unconfirmedTracksIndexes[match[0]]
 		det := unmatchedDetsHigh[match[1]]
 
-		t.tracksPool[trackID].mean = means[i]
-		t.tracksPool[trackID].cov = covs[i]
+		t.tracksPool[trackID].mean = t.means[i]
+		t.tracksPool[trackID].cov = t.covs[i]
 		t.tracksPool[trackID].detection = det
 		t.tracksPool[trackID].TrackState = Tracked
 		t.tracksPool[trackID].activated = true
@@ -273,26 +291,30 @@ func (t *Tracker[T]) Update(detsXYXY []T) ([]Track[T], []Track[T]) {
 		detsToTracksBoxes[i][1] += detsToTracksBoxes[i][3] / 2
 	}
 
-	means, covs = kalman.GetFilter().MultiInitiate(detsToTracksBoxes)
+	t.means = utils.AdjustSliceSize(t.means, len(detsToTracksBoxes))
+	t.covs = utils.AdjustSliceSize(t.covs, len(detsToTracksBoxes))
 
-	for i := range means {
+	kalman.GetFilter().MultiInitiate(detsToTracksBoxes, t.means, t.covs)
+
+	for i := range t.means {
 		t.tracksPool[t.trackID] = &track[T]{
 			TrackState:             Tracked,
 			id:                     t.trackID,
 			activated:              t.frameID == 1,
 			detection:              detsToTracks[i],
-			mean:                   means[i],
-			cov:                    covs[i],
+			mean:                   t.means[i],
+			cov:                    t.covs[i],
 			lastDetectionFrameIdx:  t.frameID,
 			firstDetectionFrameIdx: t.frameID,
 		}
+
 		t.trackID++
 	}
 
 	var removedTracks []Track[T]
 	var trackedTracks []Track[T]
 	for id, track := range t.tracksPool {
-		if track.TrackState == Lost && t.frameID-track.lastDetectionFrameIdx > t.maxTimeLost {
+		if track.TrackState == Lost && t.frameID-track.lastDetectionFrameIdx > t.MaxFramesLost {
 			removedTracks = append(removedTracks, track)
 			delete(t.tracksPool, id)
 		}
@@ -315,7 +337,7 @@ func (t *Tracker[T]) Update(detsXYXY []T) ([]Track[T], []Track[T]) {
 
 	for ti, row := range dists {
 		for li, x := range row {
-			if x < 0.15 {
+			if x < t.RemoveDuplicateThresh {
 				id1 := trackedIdxs[ti]
 				id2 := lostIdxs[li]
 				t1, found := t.tracksPool[id1]
@@ -359,9 +381,9 @@ func (t *Tracker[T]) splitDets(detsXYXY []T) (detsHigh, detsLow []T) {
 	indsLow := make([]int, 0)
 	for i := 0; i < rows; i++ {
 		conf := detsXYXY[i].GetScore()
-		if conf > t.trackHighThresh {
+		if conf > t.DetHighThresh {
 			indsHigh = append(indsHigh, i)
-		} else if conf > t.trackLowThresh && conf <= t.trackHighThresh {
+		} else if conf > t.DetLowThresh && conf <= t.DetHighThresh {
 			indsLow = append(indsLow, i)
 		}
 	}

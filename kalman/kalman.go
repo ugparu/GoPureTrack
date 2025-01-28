@@ -27,7 +27,7 @@ var (
 type Filter interface {
 	MultiPredict(means [][8]float64, covs [][64]float64)
 	MultiUpdate(means [][8]float64, covs [][64]float64, measurements [][4]float64)
-	MultiInitiate(m [][4]float64) ([][8]float64, [][64]float64)
+	MultiInitiate(measurments [][4]float64, means [][8]float64, covs [][64]float64)
 }
 
 type filter struct {
@@ -118,20 +118,23 @@ func (kf *filter) GetMultiProcessNoiseStd(means [][4]float64) ([][4]float64, [][
 	return stdPos, stdVel
 }
 
-func (df *filter) MultiInitiate(m [][4]float64) ([][8]float64, [][64]float64) {
-	mean := make([][8]float64, len(m))
-	covariances := make([][64]float64, len(m))
-
+func (df *filter) MultiInitiate(m [][4]float64, means [][8]float64, covs [][64]float64) {
 	for i, measurement := range m {
-		copy(mean[i][:4], measurement[:])
+		copy(means[i][:4], measurement[:])
+		means[i][4] = 0
+		means[i][5] = 0
+		means[i][6] = 0
+		means[i][7] = 0
+
+		for j := range covs[i] {
+			covs[i][j] = 0
+		}
 
 		std := df.GetInitialCovariancesStd([][4]float64{measurement})[0]
 		for j := 0; j < 8; j++ {
-			covariances[i][j*8+j] = std[j] * std[j]
+			covs[i][j*8+j] = std[j] * std[j]
 		}
 	}
-
-	return mean, covariances
 }
 
 func (df *filter) MultiPredict(means [][8]float64, covs [][64]float64) {

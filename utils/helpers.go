@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"slices"
+
 	"gonum.org/v1/gonum/mat"
 )
 
@@ -131,4 +133,8 @@ func SearchInMap[K comparable, V any](pool map[K]V, f func(V) bool) []K {
 		}
 	}
 	return keys
+}
+
+func AdjustSliceSize[T any](slice []T, size int) []T {
+	return slices.Grow(slice, size)[:size]
 }
