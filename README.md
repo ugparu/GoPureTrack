@@ -47,7 +47,7 @@ func (d Detection) GetScore() float64 {
 func main() {
 	tracker := puretrack.New[Detection](puretrack.BaseConfig)
 
-    detections := []Detection{......}
+	detections := []Detection{......}
 
 	trackedObjects, removedTracks := tracker.Update(detections)
 	fmt.Println("Tracked objects:", trackedObjects)
